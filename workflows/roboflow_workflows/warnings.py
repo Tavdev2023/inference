@@ -1,2 +1,0 @@
-class WorkflowsExperimentalFeatureWarning(Warning):
-    pass

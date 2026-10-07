@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://inference.roboflow.com/sitemap.xml

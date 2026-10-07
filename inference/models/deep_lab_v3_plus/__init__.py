@@ -1,3 +1,0 @@
-from inference.models.deep_lab_v3_plus.deep_lab_v3_plus_segmentation import (
-    DeepLabV3PlusSemanticSegmentation,
-)

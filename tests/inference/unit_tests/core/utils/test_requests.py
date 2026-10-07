@@ -1,0 +1,175 @@
+import pytest
+from aiohttp import ClientResponseError, RequestInfo
+from requests import HTTPError, Response
+from yarl import URL
+
+from inference.core.utils.requests import (
+    API_KEY_PATTERN,
+    api_key_safe_raise_for_status,
+    api_key_safe_raise_for_status_aiohttp,
+    deduct_api_key,
+    deduct_api_key_from_string,
+)
+
+
+def test_deduce_api_key_when_no_api_key_available() -> None:
+    # given
+    url = "https://some.com/endpoint?param_1=12098xx87s&param_2=2982s8x"
+
+    # when
+    result = API_KEY_PATTERN.sub(deduct_api_key, url)
+
+    # then
+    assert result == url
+
+
+def test_deduce_api_key_when_short_api_key_available() -> None:
+    # given
+    url = "https://some.com/endpoint?api_key=my_key&param_2=some_value"
+
+    # when
+    result = API_KEY_PATTERN.sub(deduct_api_key, url)
+
+    # then
+    assert result == "https://some.com/endpoint?api_key=***&param_2=some_value"
+
+
+def test_deduce_api_key_when_single_long_api_key_available() -> None:
+    # given
+    url = "https://some.com/endpoint?api_key=19xjs9-XSXSAos0s&param_2=some_value"
+
+    # when
+    result = API_KEY_PATTERN.sub(deduct_api_key, url)
+
+    # then
+    assert result == "https://some.com/endpoint?api_key=19***0s&param_2=some_value"
+
+
+def test_deduce_api_key_when_multiple_api_key_available() -> None:
+    # given
+    url = "https://some.com/endpoint?api_key=19xjs9-XSXSAos0s&param_2=some_value&api_key=my_key"
+
+    # when
+    result = API_KEY_PATTERN.sub(deduct_api_key, url)
+
+    # then
+    assert (
+        result
+        == "https://some.com/endpoint?api_key=19***0s&param_2=some_value&api_key=***"
+    )
+
+
+@pytest.mark.parametrize("status_code", [200, 201, 300])
+def test_api_key_safe_raise_for_status_when_no_error_occurs(status_code: int) -> None:
+    # given
+    response = Response()
+    response.status_code = status_code
+
+    # when
+    api_key_safe_raise_for_status(response=response)
+
+    # then no error happens
+
+
+@pytest.mark.parametrize(
+    "status_code", [400, 401, 402, 403, 404, 500, 501, 502, 503, 504]
+)
+def test_api_keysafe_raise_for_status_when_error_occurs(status_code: int) -> None:
+    # given
+    response = Response()
+    response.status_code = status_code
+    response.url = (
+        "https://some.com/endpoint?api_key=19xjs9-XSXSAos0s&param_2=some_value"
+    )
+
+    # when
+    with pytest.raises(HTTPError) as expected_error:
+        api_key_safe_raise_for_status(response=response)
+
+    # then
+    assert "https://some.com/endpoint?api_key=19***0s&param_2=some_value" in str(
+        expected_error.value
+    )
+
+
+def test_api_key_safe_raise_for_status_aiohttp_deducts_the_service_secret() -> None:
+    # given - the URL carries both the caller's api key and the server's own
+    # service secret; neither may leak into the raised error
+    class FakeAiohttpResponse:
+        def __init__(self, status: int, url: str) -> None:
+            self.status = status
+            self.request_info = RequestInfo(
+                url=URL(url),
+                method="GET",
+                headers={},  # type: ignore
+            )
+
+        def raise_for_status(self) -> None:
+            raise ClientResponseError(
+                request_info=self.request_info,
+                history=(),
+                status=self.status,
+                message="Internal Server Error",
+            )
+
+    response = FakeAiohttpResponse(
+        status=500,
+        url=(
+            "https://some.com/endpoint?api_key=19xjs9-XSXSAos0s"
+            "&service_secret=super-secret&param_2=some_value"
+        ),
+    )
+
+    # when
+    with pytest.raises(ClientResponseError) as expected_error:
+        api_key_safe_raise_for_status_aiohttp(response=response)
+
+    # then
+    assert "super-secret" not in str(expected_error.value)
+    assert "19xjs9-XSXSAos0s" not in str(expected_error.value)
+    assert "service_secret=***" in str(expected_error.value)
+    assert "api_key=19***0s" in str(expected_error.value)
+    assert "param_2=some_value" in str(expected_error.value)
+
+
+def test_deduct_api_key_from_string_redacts_url_embedded_key() -> None:
+    # given - the shape requests.HTTPError / ConnectionError messages take
+    value = (
+        "500 Server Error: Internal Server Error for url: "
+        "https://api.roboflow.com/inferenceproxy/sam3?api_key=fake12345678&foo=bar"
+    )
+
+    # when
+    result = deduct_api_key_from_string(value=value)
+
+    # then
+    assert "fake12345678" not in result
+    assert "api_key=fa***78" in result
+    assert "foo=bar" in result
+
+
+def test_deduct_api_key_from_string_redacts_url_embedded_service_secret() -> None:
+    # given - the secret belongs to the server rather than the caller, so unlike
+    # the api key it keeps no identifiable prefix
+    value = (
+        "500 Server Error: Internal Server Error for url: "
+        "https://api.roboflow.com/some/1?api_key=fake12345678"
+        "&service_secret=super-secret&countinference=False"
+    )
+
+    # when
+    result = deduct_api_key_from_string(value=value)
+
+    # then
+    assert "super-secret" not in result
+    assert "service_secret=***" in result
+    assert "api_key=fa***78" in result
+    assert "countinference=False" in result
+
+
+def test_deduct_api_key_from_string_leaves_keyless_text_untouched() -> None:
+    # when
+    result = deduct_api_key_from_string(value="connection refused to host x")
+
+    # then
+    assert result == "connection refused to host x"

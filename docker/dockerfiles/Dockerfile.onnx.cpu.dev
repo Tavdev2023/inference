@@ -1,0 +1,96 @@
+FROM python:3.11-bookworm as base
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt update -y && apt install -y \
+    libxext6 \
+    libopencv-dev \
+    uvicorn \
+    python3-pip \
+    git \
+    ffmpeg \
+    libgdal-dev \
+    libvips-dev \
+    cmake \
+    rustc \
+    cargo \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements/requirements.sam.txt \
+    requirements/requirements.clip.txt \
+    requirements/requirements.cpu.txt \
+    requirements/requirements.vino.txt \
+    requirements/requirements.http.txt \
+    requirements/requirements.doctr.txt \
+    requirements/requirements.groundingdino.txt \
+    requirements/requirements.yolo_world.txt \
+    requirements/requirements.transformers.txt \
+    requirements/_requirements.txt \
+    requirements/requirements.easyocr.txt \
+    requirements/requirements.modal.txt \
+    ./
+
+RUN pip3 install --upgrade pip && pip3 install "wheel>=0.38.1,<=0.45.1"
+RUN pip3 install \
+    -r _requirements.txt \
+    -r requirements.sam.txt \
+    -r requirements.clip.txt \
+    -r requirements.cpu.txt \
+    -r requirements.http.txt \
+    -r requirements.doctr.txt \
+    -r requirements.groundingdino.txt \
+    -r requirements.yolo_world.txt \
+    -r requirements.transformers.txt \
+    -r requirements.easyocr.txt \
+    -r requirements.modal.txt \
+    jupyterlab \
+    "setuptools~=83.0.0" \
+    --upgrade \
+    && rm -rf ~/.cache/pip
+
+FROM scratch
+ARG TARGETPLATFORM
+
+COPY --from=base / /
+
+WORKDIR /build
+COPY . .
+RUN make create_wheels
+RUN pip3 install --find-links dist/ dist/roboflow_workflows*.whl dist/streamvision*.whl dist/inference_cli*.whl dist/inference_core*.whl dist/inference_cpu*.whl dist/inference_sdk*.whl "setuptools~=83.0.0"
+RUN pip3 install watchdog[watchmedo]
+RUN if [ "${TARGETPLATFORM}" = "linux/amd64" ]; then pip3 install -r requirements/requirements.vino.txt; rm -rf ~/.cache/pip; fi
+
+# Pillow-SIMD (x86-64 only), beside Pillow under /opt so the wheel stays the `PIL` package.
+RUN mkdir -p /opt/pillow_simd && if [ "${TARGETPLATFORM}" = "linux/amd64" ]; then \
+      pip3 install --no-cache-dir --no-deps --target /opt/pillow_simd -r requirements/requirements.pillow-simd.txt && \
+      python3 docker/scripts/verify_pillow_simd.py; \
+    fi
+
+
+WORKDIR /notebooks
+COPY examples/notebooks .
+
+WORKDIR /app
+COPY inference inference
+RUN cp -a /build/workflows/roboflow_workflows /app/roboflow_workflows
+RUN cp -a /build/stream_vision/streamvision /app/streamvision
+COPY docker/config/cpu_http.py cpu_http.py
+COPY docker/entrypoint/run_uvicorn.sh /usr/local/bin/run_uvicorn.sh
+RUN chmod +x /usr/local/bin/run_uvicorn.sh
+
+ENV VERSION_CHECK_MODE=continuous
+ENV PROJECT=roboflow-platform
+ENV NUM_WORKERS=1
+ENV HOST=0.0.0.0
+ENV PORT=9001
+ENV WORKFLOWS_STEP_EXECUTION_MODE=local
+ENV WORKFLOWS_MAX_CONCURRENT_STEPS=4
+ENV API_LOGGING_ENABLED=True
+ENV CORE_MODEL_SAM2_ENABLED=True
+ENV CORE_MODEL_OWLV2_ENABLED=True
+ENV ENABLE_STREAM_API=True
+ENV ENABLE_PROMETHEUS=True
+ENV CORE_MODEL_SAM3_ENABLED=False
+
+
+ENTRYPOINT watchmedo auto-restart --directory=/app --pattern=*.py --recursive -- /usr/local/bin/run_uvicorn.sh cpu_http:app

@@ -1,0 +1,129 @@
+site_name: Roboflow Inference
+site_url: https://inference.roboflow.com/
+site_author: Roboflow
+site_description: Open-source computer vision inference server for object detection, segmentation, classification, and foundation models. Deploy on-device or in the cloud.
+repo_name: roboflow/inference
+repo_url: https://github.com/roboflow/inference
+edit_uri: https://github.com/roboflow/inference/tree/main/docs
+copyright: Roboflow 2026. All rights reserved.
+
+exclude_docs: |
+  node_modules/
+
+extra:
+  analytics:
+    provider: google
+    property: G-T0CED2YY8K
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/roboflow
+    - icon: fontawesome/brands/youtube
+      link: https://www.youtube.com/roboflow
+    - icon: fontawesome/brands/linkedin
+      link: https://www.linkedin.com/company/roboflow-ai/mycompany/
+    - icon: fontawesome/brands/twitter
+      link: https://twitter.com/roboflow
+  version:
+    default: 1.0
+
+extra_css:
+  - styles/cookbooks.css
+  - styles.css
+
+nav:
+  - Home: index.md
+  - "Get Started": "https://docs.roboflow.com/deployment/self-hosted/self-hosted"
+  - "Models": "https://docs.roboflow.com/models/supported-models"
+  - "Workflows": "https://docs.roboflow.com/workflows"
+  - "Classifier Embeddings": workflows/classifier_embeddings.md
+  - "Reference": "https://docs.roboflow.com/reference/inference/choosing-the-right-tool"
+  - "Changelog": "https://github.com/roboflow/inference/releases"
+
+theme:
+  name: 'material'
+  logo: roboflow-logomark-color.svg
+  favicon: favicon.png
+  custom_dir: theme
+  font:
+    text: Inter
+    code: ui-monospace
+  features:
+    - announce.dismiss
+    - content.action.edit
+    - content.code.copy
+    - content.tabs.link
+    - navigation.footer
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.instant.preview
+    - navigation.instant.progress
+    - navigation.prune
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.tracking
+    - optimize
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - scheme: default
+      primary: 'custom'
+
+plugins:
+  - git-revision-date-localized:
+      enable_creation_date: true
+      type: date
+  - search:
+      enabled: false
+  - mkdocs-jupyter
+  - social:
+      cards: true
+      cards_layout_options:
+        background_color: "#8315F9"
+        color: "#FFFFFF"
+        font_family: Inter
+  - ezlinks
+  - macros:
+      module_name: docs/scripts/macros
+
+
+markdown_extensions:
+  - meta
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.snippets:
+      base_path: docs
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - toc:
+      permalink: true
+
+
+extra_javascript:
+  - "https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.8/purify.min.js"
+  - 'javascript/init_kapa_widget.js'
+  - 'javascript/cookbooks.js'
+  - 'javascript/workflows.js'
+  - 'https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js'
+  - 'https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollTrigger.min.js'
+  - 'https://unpkg.com/@rive-app/canvas'
+  - 'https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.js'
+  - 'assets/home.js'
+  - "https://app.roboflow.com/scripts/utm.js"
+  - 'js/segment.js'
+
+hooks:
+  - theme/build.py

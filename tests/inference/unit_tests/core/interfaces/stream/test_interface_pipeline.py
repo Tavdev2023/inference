@@ -1,0 +1,1286 @@
+from collections import defaultdict
+from concurrent.futures import Future
+from datetime import datetime
+from functools import partial
+from inspect import signature
+from queue import Queue
+from threading import Event, Lock, Thread
+from typing import Any, List, Optional, Tuple, Union
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
+
+from inference.core.active_learning.middlewares import ThreadingActiveLearningMiddleware
+from inference.core.cache import MemoryCache
+from inference.core.entities.responses.inference import (
+    InferenceResponseImage,
+    ObjectDetectionInferenceResponse,
+    ObjectDetectionPrediction,
+)
+from inference.core.interfaces.camera.entities import (
+    StatusUpdate,
+    VideoFrame,
+    VideoFrameProducer,
+)
+from inference.core.interfaces.camera.exceptions import (
+    EndOfStreamError,
+    SourceConnectionError,
+)
+from inference.core.interfaces.camera.video_source import (
+    SourceMetadata,
+    SourceProperties,
+    StreamState,
+    VideoSource,
+    lock_state_transition,
+)
+from inference.core.interfaces.stream.entities import (
+    InferenceHandlerResult,
+    ModelConfig,
+)
+from inference.core.interfaces.stream.inference_pipeline import (
+    InferencePipeline,
+    _resolve_prediction_futures,
+)
+from inference.core.interfaces.stream.model_handlers.roboflow_models import (
+    default_process_frame,
+)
+from inference.core.interfaces.stream.sinks import active_learning_sink, multi_sink
+from inference.core.interfaces.stream.watchdog import BasePipelineWatchDog
+
+
+class VideoSourceStub:
+    def __init__(
+        self, frames_number: int, is_file: bool, rounds: int = 0, source_id: int = 0
+    ):
+        self._frames_number = frames_number
+        self._is_file = is_file
+        self._current_round = 0
+        self._emissions_in_current_round = 0
+        self._rounds = rounds
+        self._calls = []
+        self._frame_id = 0
+        self._state_change_lock = Lock()
+        self.on_end = None
+        self.source_id = source_id
+
+    @lock_state_transition
+    def restart(
+        self, wait_on_frames_consumption: bool = True, purge_frames_buffer: bool = False
+    ) -> None:
+        self._calls.append("restart")
+        if self._current_round == self._rounds:
+            self.on_end()
+            raise SourceConnectionError()
+        self._current_round += 1
+        self._emissions_in_current_round = 0
+
+    @lock_state_transition
+    def start(self) -> None:
+        self._calls.append("start")
+        self._current_round += 1
+        self._emissions_in_current_round = 0
+
+    def pause(self) -> None:
+        self._calls.append("pause")
+
+    def mute(self) -> None:
+        self._calls.append("mute")
+
+    def resume(self) -> None:
+        self._calls.append("resume")
+
+    @lock_state_transition
+    def terminate(
+        self, wait_on_frames_consumption: bool = True, purge_frames_buffer: bool = False
+    ) -> None:
+        self._calls.append("terminate")
+
+    def describe_source(self) -> SourceMetadata:
+        return SourceMetadata(
+            source_properties=SourceProperties(
+                is_file=self._is_file,
+                width=100,
+                height=100,
+                fps=25,
+                total_frames=10,
+            ),
+            source_reference="dummy",
+            buffer_size=32,
+            state=StreamState.RUNNING,
+            buffer_filling_strategy=None,
+            buffer_consumption_strategy=None,
+            source_id=self.source_id,
+        )
+
+    def read_frame(self, timeout: Optional[float] = None) -> VideoFrame:
+        self._calls.append("read_frame")
+        if self._emissions_in_current_round == self._frames_number:
+            raise EndOfStreamError()
+        self._frame_id += 1
+        self._emissions_in_current_round += 1
+        return VideoFrame(
+            image=np.zeros((128, 128, 3), dtype=np.uint8),
+            frame_id=self._frame_id,
+            frame_timestamp=datetime.now(),
+            source_id=self.source_id,
+        )
+
+    def __iter__(self) -> "VideoSourceStub":
+        return self
+
+    def __next__(self) -> VideoFrame:
+        try:
+            return self.read_frame()
+        except EndOfStreamError:
+            raise StopIteration()
+
+
+class ModelStub:
+    def __init__(self):
+        self.api_key = None
+
+    def infer(self, image: Any, **kwargs) -> List[ObjectDetectionInferenceResponse]:
+        return [
+            ObjectDetectionInferenceResponse(
+                predictions=[
+                    ObjectDetectionPrediction(
+                        **{
+                            "x": 10,
+                            "y": 20,
+                            "width": 30,
+                            "height": 40,
+                            "confidence": 0.9,
+                            "class": "car",
+                            "class_id": 3,
+                        }
+                    )
+                ],
+                image=InferenceResponseImage(width=1920, height=1080),
+            )
+        ] * len(image)
+
+
+class _PredictionReadyWatchdog:
+    def __init__(self) -> None:
+        self.ready_frames = []
+
+    def on_model_prediction_ready(self, frames):
+        self.ready_frames.append(frames)
+
+
+class _FlushableInferenceHandler:
+    def __init__(self, results):
+        self.results = results
+        self.flush_calls = 0
+        self.close_calls = 0
+
+    def flush(self):
+        self.flush_calls += 1
+        return self.results
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_inference_pipeline_drain_enqueues_flush_results_with_bound_frames() -> None:
+    frame_1 = VideoFrame(
+        image=np.zeros((8, 8, 3), dtype=np.uint8),
+        frame_id=1,
+        frame_timestamp=datetime.now(),
+        source_id=0,
+    )
+    frame_2 = VideoFrame(
+        image=np.zeros((8, 8, 3), dtype=np.uint8),
+        frame_id=2,
+        frame_timestamp=datetime.now(),
+        source_id=0,
+    )
+    handler = _FlushableInferenceHandler(
+        results=[
+            InferenceHandlerResult(predictions=["p1"], video_frames=[frame_1]),
+            InferenceHandlerResult(predictions=["p2"], video_frames=[frame_2]),
+        ]
+    )
+    watchdog = _PredictionReadyWatchdog()
+    pipeline = object.__new__(InferencePipeline)
+    pipeline._on_video_frame = handler
+    pipeline._watchdog = watchdog
+    pipeline._predictions_queue = Queue()
+    pipeline._status_update_handlers = []
+
+    pipeline._drain_inference_handler()
+
+    assert handler.flush_calls == 1
+    assert pipeline._predictions_queue.get_nowait() == (["p1"], [frame_1])
+    assert pipeline._predictions_queue.get_nowait() == (["p2"], [frame_2])
+    assert watchdog.ready_frames == [[frame_1], [frame_2]]
+
+
+def test_resolve_prediction_futures_recursively_resolves_nested_values() -> None:
+    inner = Future()
+    inner.set_result("resolved")
+    outer = Future()
+    outer.set_result({"detections": [inner]})
+
+    assert _resolve_prediction_futures((outer, {"raw": inner})) == (
+        {"detections": ["resolved"]},
+        {"raw": "resolved"},
+    )
+
+
+def test_inference_pipeline_close_calls_handler_close_hook() -> None:
+    handler = _FlushableInferenceHandler(results=[])
+    pipeline = object.__new__(InferencePipeline)
+    pipeline._on_video_frame = handler
+
+    pipeline._close_inference_handler()
+
+    assert handler.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("method_name", "expected_call"),
+    [
+        ("pause_stream", "pause"),
+        ("mute_stream", "mute"),
+        ("resume_stream", "resume"),
+    ],
+)
+def test_stream_control_applies_to_all_sources(
+    method_name: str, expected_call: str
+) -> None:
+    first_source = VideoSourceStub(frames_number=0, is_file=False, source_id=0)
+    second_source = VideoSourceStub(frames_number=0, is_file=False, source_id=1)
+    pipeline = object.__new__(InferencePipeline)
+    pipeline._video_sources = [first_source, second_source]
+
+    getattr(pipeline, method_name)()
+
+    assert first_source._calls == [expected_call]
+    assert second_source._calls == [expected_call]
+
+
+@pytest.mark.parametrize(
+    ("method_name", "expected_call"),
+    [
+        ("pause_stream", "pause"),
+        ("mute_stream", "mute"),
+        ("resume_stream", "resume"),
+    ],
+)
+def test_stream_control_applies_to_matching_source(
+    method_name: str, expected_call: str
+) -> None:
+    first_source = VideoSourceStub(frames_number=0, is_file=False, source_id=0)
+    second_source = VideoSourceStub(frames_number=0, is_file=False, source_id=1)
+    pipeline = object.__new__(InferencePipeline)
+    pipeline._video_sources = [first_source, second_source]
+
+    getattr(pipeline, method_name)(source_id=1)
+
+    assert first_source._calls == []
+    assert second_source._calls == [expected_call]
+
+
+@pytest.mark.parametrize(
+    "method_name", ["pause_stream", "mute_stream", "resume_stream"]
+)
+def test_stream_control_ignores_unknown_source(method_name: str) -> None:
+    first_source = VideoSourceStub(frames_number=0, is_file=False, source_id=0)
+    second_source = VideoSourceStub(frames_number=0, is_file=False, source_id=1)
+    pipeline = object.__new__(InferencePipeline)
+    pipeline._video_sources = [first_source, second_source]
+
+    getattr(pipeline, method_name)(source_id=2)
+
+    assert first_source._calls == []
+    assert second_source._calls == []
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.slow
+def test_inference_pipeline_works_correctly_against_video_file(
+    local_video_path: str,
+) -> None:
+    # given
+    model = ModelStub()
+    video_source = VideoSource.init(video_reference=local_video_path)
+    watchdog = BasePipelineWatchDog()
+    watchdog.register_video_sources(video_sources=[video_source])
+    predictions = []
+
+    def on_prediction(prediction: dict, video_frame: VideoFrame) -> None:
+        predictions.append((video_frame, prediction))
+
+    status_update_handlers = [watchdog.on_status_update]
+    inference_config = ModelConfig.init(confidence=0.5, iou_threshold=0.5)
+    process_frame_func = partial(
+        default_process_frame, model=model, inference_config=inference_config
+    )
+    predictions_queue = Queue(maxsize=512)
+    inference_pipeline = InferencePipeline(
+        on_video_frame=process_frame_func,
+        video_sources=[video_source],
+        on_prediction=on_prediction,
+        max_fps=100,
+        predictions_queue=predictions_queue,
+        watchdog=watchdog,
+        status_update_handlers=status_update_handlers,
+    )
+
+    # when
+    inference_pipeline.start()
+    inference_pipeline.join()
+    inference_pipeline.start()
+    inference_pipeline.join()
+
+    # then
+    assert len(predictions) == 431 * 2, "Not all video frames processed"
+    assert [p[0].frame_id for p in predictions] == list(
+        range(1, 431 * 2 + 1)
+    ), "Order of prediction frames violated"
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.slow
+def test_inference_pipeline_works_correctly_against_multiple_video_files(
+    local_video_path: str,
+) -> None:
+    # given
+    model = ModelStub()
+    watchdog = BasePipelineWatchDog()
+    accumulator = []
+
+    def on_prediction(predictions: List[dict], video_frames: List[VideoFrame]) -> None:
+        for frame_prediction, frame_prediction in zip(predictions, video_frames):
+            if frame_prediction is None:
+                continue
+            accumulator.append((frame_prediction, frame_prediction))
+
+    inference_config = ModelConfig.init(confidence=0.5, iou_threshold=0.5)
+    process_frame_func = partial(
+        default_process_frame, model=model, inference_config=inference_config
+    )
+    inference_pipeline = InferencePipeline.init_with_custom_logic(
+        video_reference=[local_video_path, local_video_path],
+        on_video_frame=process_frame_func,
+        on_prediction=on_prediction,
+        max_fps=200,
+        watchdog=watchdog,
+    )
+
+    # when
+    inference_pipeline.start()
+    inference_pipeline.join()
+    inference_pipeline.start()
+    inference_pipeline.join()
+
+    # then
+    assert len(accumulator) == 431 * 2 * 2, "Not all video frames processed"
+    frames_by_sources = defaultdict(list)
+    for p in accumulator:
+        frames_by_sources[p[0].source_id].append(p[0].frame_id)
+    assert (
+        len(frames_by_sources) == 2
+    ), "Expected to register frames from exactly 2 video sources"
+    assert frames_by_sources[0] == sorted(
+        frames_by_sources[0]
+    ), "Order of prediction frames violated for source 0"
+    assert frames_by_sources[1] == sorted(
+        frames_by_sources[1]
+    ), "Order of prediction frames violated for source 1"
+
+
+@pytest.mark.parametrize("use_main_thread", [True, False])
+def test_inference_pipeline_works_correctly_against_stream_including_reconnections(
+    use_main_thread: bool,
+) -> None:
+    # given
+    model = ModelStub()
+    video_source = VideoSourceStub(frames_number=100, is_file=False, rounds=2)
+    watchdog = BasePipelineWatchDog()
+    watchdog.register_video_sources(video_sources=[video_source])
+    predictions = []
+
+    def on_prediction(prediction: dict, video_frame: VideoFrame) -> None:
+        predictions.append((video_frame, prediction))
+
+    status_update_handlers = [watchdog.on_status_update]
+    inference_config = ModelConfig.init(confidence=0.5, iou_threshold=0.5)
+    process_frame_func = partial(
+        default_process_frame, model=model, inference_config=inference_config
+    )
+    predictions_queue = Queue(maxsize=512)
+    inference_pipeline = InferencePipeline(
+        on_video_frame=process_frame_func,
+        video_sources=[video_source],
+        on_prediction=on_prediction,
+        max_fps=None,
+        predictions_queue=predictions_queue,
+        watchdog=watchdog,
+        status_update_handlers=status_update_handlers,
+    )
+
+    def stop() -> None:
+        inference_pipeline._stop = True
+
+    video_source.on_end = stop
+
+    # when
+    inference_pipeline.start(use_main_thread=use_main_thread)
+    inference_pipeline.join()
+
+    # then
+    assert (
+        0 < len(predictions) <= 200
+    ), "Expected to process some frames, but not more than max number of emitted frames"
+    frame_ids = [p[0].frame_id for p in predictions]
+    assert frame_ids == sorted(frame_ids), "Order of prediction frames violated"
+    assert (
+        max(frame_ids) > 100
+    ), "Expected to process at least one frame after reconnection"
+
+
+@pytest.mark.parametrize("use_main_thread", [True, False])
+def test_inference_pipeline_works_correctly_against_multiple_streams_including_reconnections(
+    use_main_thread: bool,
+) -> None:
+    # given
+    model = ModelStub()
+    video_source_1 = VideoSourceStub(
+        frames_number=100, is_file=False, rounds=2, source_id=0
+    )
+    video_source_2 = VideoSourceStub(
+        frames_number=130, is_file=False, rounds=2, source_id=1
+    )
+    watchdog = BasePipelineWatchDog()
+    watchdog.register_video_sources(video_sources=[video_source_1, video_source_2])
+    accumulator = []
+
+    def on_prediction(predictions: List[dict], video_frames: List[VideoFrame]) -> None:
+        for frame_prediction, video_frame in zip(predictions, video_frames):
+            if frame_prediction is None:
+                continue
+            accumulator.append((video_frame, frame_prediction))
+
+    status_update_handlers = [watchdog.on_status_update]
+    inference_config = ModelConfig.init(confidence=0.5, iou_threshold=0.5)
+    process_frame_func = partial(
+        default_process_frame, model=model, inference_config=inference_config
+    )
+    predictions_queue = Queue(maxsize=512)
+    inference_pipeline = InferencePipeline(
+        on_video_frame=process_frame_func,
+        video_sources=[video_source_1, video_source_2],
+        on_prediction=on_prediction,
+        max_fps=None,
+        predictions_queue=predictions_queue,
+        watchdog=watchdog,
+        status_update_handlers=status_update_handlers,
+    )
+
+    stop_counter = []
+    stop_counter_lock = Lock()
+
+    def stop() -> None:
+        with stop_counter_lock:
+            stop_counter.append(1)
+            if len(stop_counter) == 2:
+                inference_pipeline._stop = True
+
+    video_source_1.on_end = stop
+    video_source_2.on_end = stop
+
+    # when
+    inference_pipeline.start(use_main_thread=use_main_thread)
+    inference_pipeline.join()
+
+    # then
+    assert (
+        0 < len(accumulator) <= 100 * 2 + 130 * 2
+    ), "Expected to process some frames, but not more than max number of emitted frames"
+    frames_by_sources = defaultdict(list)
+    for p in accumulator:
+        frames_by_sources[p[0].source_id].append(p[0].frame_id)
+    assert (
+        len(frames_by_sources) == 2
+    ), "Expected to register frames from exactly 2 video sources"
+    assert frames_by_sources[0] == sorted(
+        frames_by_sources[0]
+    ), "Order of prediction frames violated for source 0"
+    assert frames_by_sources[1] == sorted(
+        frames_by_sources[1]
+    ), "Order of prediction frames violated for source 1"
+    assert (
+        max(frames_by_sources[0]) > 100
+    ), "Expected to process at least one frame after reconnection to source 1"
+    assert (
+        max(frames_by_sources[1]) > 130
+    ), "Expected to process at least one frame after reconnection to source 2"
+
+
+@pytest.mark.parametrize("use_main_thread", [True, False])
+def test_inference_pipeline_works_correctly_against_stream_including_dispatching_errors(
+    use_main_thread: bool,
+) -> None:
+    # given
+    model = ModelStub()
+    video_source = VideoSourceStub(frames_number=100, is_file=False, rounds=1)
+    watchdog = BasePipelineWatchDog()
+    watchdog.register_video_sources(video_sources=[video_source])
+    predictions = []
+
+    def on_prediction(prediction: dict, video_frame: VideoFrame) -> None:
+        predictions.append((video_frame, prediction))
+        raise Exception()
+
+    status_update_handlers = [watchdog.on_status_update]
+    inference_config = ModelConfig.init(confidence=0.5, iou_threshold=0.5)
+    process_frame_func = partial(
+        default_process_frame, model=model, inference_config=inference_config
+    )
+
+    predictions_queue = Queue(maxsize=512)
+    inference_pipeline = InferencePipeline(
+        on_video_frame=process_frame_func,
+        video_sources=[video_source],
+        on_prediction=on_prediction,
+        max_fps=None,
+        predictions_queue=predictions_queue,
+        watchdog=watchdog,
+        status_update_handlers=status_update_handlers,
+    )
+
+    def stop() -> None:
+        inference_pipeline._stop = True
+
+    video_source.on_end = stop
+
+    # when
+    inference_pipeline.start(use_main_thread=use_main_thread)
+    inference_pipeline.join()
+
+    # then
+    assert (
+        0 < len(predictions) <= 100
+    ), "Expected to process some frames, but not more than max number of emitted frames"
+    frames_ids = [p[0].frame_id for p in predictions]
+    assert frames_ids == sorted(frames_ids), "Order of prediction frames violated"
+
+
+@pytest.mark.parametrize("use_main_thread", [True])
+def test_inference_pipeline_works_correctly_against_multiple_streams_including_dispatching_errors(
+    use_main_thread: bool,
+) -> None:
+    # given
+    model = ModelStub()
+    video_source_1 = VideoSourceStub(
+        frames_number=100, is_file=False, rounds=2, source_id=0
+    )
+    video_source_2 = VideoSourceStub(
+        frames_number=130, is_file=False, rounds=2, source_id=1
+    )
+    watchdog = BasePipelineWatchDog()
+    watchdog.register_video_sources(video_sources=[video_source_1, video_source_2])
+    accumulator = []
+
+    def on_prediction(predictions: List[dict], video_frames: List[VideoFrame]) -> None:
+        for frame_prediction, video_frame in zip(predictions, video_frames):
+            if frame_prediction is None:
+                continue
+            accumulator.append((video_frame, frame_prediction))
+        raise Exception()
+
+    status_update_handlers = [watchdog.on_status_update]
+    inference_config = ModelConfig.init(confidence=0.5, iou_threshold=0.5)
+    process_frame_func = partial(
+        default_process_frame, model=model, inference_config=inference_config
+    )
+    predictions_queue = Queue(maxsize=1024)
+    inference_pipeline = InferencePipeline(
+        on_video_frame=process_frame_func,
+        video_sources=[video_source_1, video_source_2],
+        on_prediction=on_prediction,
+        max_fps=None,
+        predictions_queue=predictions_queue,
+        watchdog=watchdog,
+        status_update_handlers=status_update_handlers,
+    )
+
+    stop_counter = []
+    stop_counter_lock = Lock()
+
+    def stop() -> None:
+        with stop_counter_lock:
+            stop_counter.append(1)
+            if len(stop_counter) == 2:
+                inference_pipeline._stop = True
+
+    video_source_1.on_end = stop
+    video_source_2.on_end = stop
+
+    # when
+    inference_pipeline.start(use_main_thread=use_main_thread)
+    inference_pipeline.join()
+
+    # then
+    assert (
+        0 < len(accumulator) <= 100 * 2 + 130 * 2
+    ), "Expected to process some frames, but not more than max number of emitted frames"
+    frames_by_sources = defaultdict(list)
+    for p in accumulator:
+        frames_by_sources[p[0].source_id].append(p[0].frame_id)
+    assert (
+        len(frames_by_sources) == 2
+    ), "Expected to register frames from exactly 2 video sources"
+    assert frames_by_sources[0] == sorted(
+        frames_by_sources[0]
+    ), "Order of prediction frames violated for source 0"
+    assert frames_by_sources[1] == sorted(
+        frames_by_sources[1]
+    ), "Order of prediction frames violated for source 1"
+    assert (
+        max(frames_by_sources[0]) > 100
+    ), "Expected to process at least one frame after reconnection to source 1"
+    assert (
+        max(frames_by_sources[1]) > 130
+    ), "Expected to process at least one frame after reconnection to source 2"
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.slow
+def test_inference_pipeline_works_correctly_against_video_file_with_active_learning_enabled(
+    local_video_path: str,
+) -> None:
+    # given
+    model = ModelStub()
+    video_source = VideoSource.init(video_reference=local_video_path)
+    watchdog = BasePipelineWatchDog()
+    watchdog.register_video_sources(video_sources=[video_source])
+    predictions = []
+    al_datapoints = []
+    active_learning_middleware = ThreadingActiveLearningMiddleware(
+        api_key="xxx",
+        configuration=MagicMock(),
+        cache=MemoryCache(),
+        task_queue=Queue(),
+    )
+
+    def execute_registration_mock(
+        inference_input: Any,
+        prediction: dict,
+        prediction_type: str,
+        disable_preproc_auto_orient: bool = False,
+    ) -> None:
+        al_datapoints.append((inference_input, prediction))
+
+    active_learning_middleware._execute_registration = execute_registration_mock
+    al_sink = partial(
+        active_learning_sink,
+        active_learning_middleware=active_learning_middleware,
+        model_type="object-detection",
+        disable_preproc_auto_orient=False,
+    )
+
+    def on_prediction(
+        prediction: Union[dict, List[Optional[dict]]],
+        video_frame: Union[VideoFrame, List[Optional[VideoFrame]]],
+    ) -> None:
+        predictions.append((video_frame, prediction))
+
+    prediction_handler = partial(multi_sink, sinks=[on_prediction, al_sink])
+
+    status_update_handlers = [watchdog.on_status_update]
+    inference_config = ModelConfig.init(confidence=0.5, iou_threshold=0.5)
+    process_frame_func = partial(
+        default_process_frame, model=model, inference_config=inference_config
+    )
+    predictions_queue = Queue(maxsize=512)
+    inference_pipeline = InferencePipeline(
+        on_video_frame=process_frame_func,
+        video_sources=[video_source],
+        on_prediction=prediction_handler,
+        max_fps=100,
+        predictions_queue=predictions_queue,
+        watchdog=watchdog,
+        status_update_handlers=status_update_handlers,
+        on_pipeline_start=lambda: active_learning_middleware.start_registration_thread(),
+        on_pipeline_end=lambda: active_learning_middleware.stop_registration_thread(),
+    )
+
+    # when
+    inference_pipeline.start()
+    inference_pipeline.join()
+    inference_pipeline.start()
+    inference_pipeline.join()
+
+    # then
+    assert len(predictions) == 431 * 2, "Not all video frames processed"
+    assert (
+        len(al_datapoints) == 431 * 2
+    ), "Not all video frames and predictions registered in AL"
+    assert [p[0].frame_id for p in predictions] == list(
+        range(1, 431 * 2 + 1)
+    ), "Order of prediction frames violated"
+    assert all(
+        [(p[0].image == al_dp[0]).all() for p, al_dp in zip(predictions, al_datapoints)]
+    ), "The same images must be registered for explicit sink and Active Learning sink"
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.slow
+def test_inference_pipeline_works_correctly_against_multiple_video_files_with_active_learning_enabled(
+    local_video_path: str,
+) -> None:
+    # given
+    model = ModelStub()
+    video_source_1 = VideoSource.init(video_reference=local_video_path, source_id=0)
+    video_source_2 = VideoSource.init(video_reference=local_video_path, source_id=1)
+    watchdog = BasePipelineWatchDog()
+    watchdog.register_video_sources(video_sources=[video_source_1, video_source_2])
+    accumulator = []
+    al_datapoints = []
+    active_learning_middleware = ThreadingActiveLearningMiddleware(
+        api_key="xxx",
+        configuration=MagicMock(),
+        cache=MemoryCache(),
+        task_queue=Queue(),
+    )
+
+    def execute_registration_mock(
+        inference_input: Any,
+        prediction: dict,
+        prediction_type: str,
+        disable_preproc_auto_orient: bool = False,
+    ) -> None:
+        al_datapoints.append((inference_input, prediction))
+
+    active_learning_middleware._execute_registration = execute_registration_mock
+    al_sink = partial(
+        active_learning_sink,
+        active_learning_middleware=active_learning_middleware,
+        model_type="object-detection",
+        disable_preproc_auto_orient=False,
+    )
+
+    def on_prediction(
+        predictions: Union[dict, List[Optional[dict]]],
+        video_frames: Union[VideoFrame, List[Optional[VideoFrame]]],
+    ) -> None:
+        for frame_prediction, video_frame in zip(predictions, video_frames):
+            if frame_prediction is None:
+                continue
+            accumulator.append((video_frame, frame_prediction))
+
+    prediction_handler = partial(multi_sink, sinks=[on_prediction, al_sink])
+
+    status_update_handlers = [watchdog.on_status_update]
+    inference_config = ModelConfig.init(confidence=0.5, iou_threshold=0.5)
+    process_frame_func = partial(
+        default_process_frame, model=model, inference_config=inference_config
+    )
+    predictions_queue = Queue(maxsize=512)
+    inference_pipeline = InferencePipeline(
+        on_video_frame=process_frame_func,
+        video_sources=[video_source_1, video_source_2],
+        on_prediction=prediction_handler,
+        max_fps=100,
+        predictions_queue=predictions_queue,
+        watchdog=watchdog,
+        status_update_handlers=status_update_handlers,
+        on_pipeline_start=lambda: active_learning_middleware.start_registration_thread(),
+        on_pipeline_end=lambda: active_learning_middleware.stop_registration_thread(),
+    )
+
+    # when
+    inference_pipeline.start()
+    inference_pipeline.join()
+    inference_pipeline.start()
+    inference_pipeline.join()
+
+    # then
+    assert len(accumulator) == 431 * 2 * 2, "Not all video frames processed"
+    assert (
+        len(al_datapoints) == 431 * 2 * 2
+    ), "Not all video frames and predictions registered in AL"
+    frames_by_sources = defaultdict(list)
+    for p in accumulator:
+        frames_by_sources[p[0].source_id].append(p[0].frame_id)
+    assert (
+        len(frames_by_sources) == 2
+    ), "Expected to register frames from exactly 2 video sources"
+    assert frames_by_sources[0] == list(
+        range(1, 431 * 2 + 1)
+    ), "Order of prediction frames violated for source 0"
+    assert frames_by_sources[1] == list(
+        range(1, 431 * 2 + 1)
+    ), "Order of prediction frames violated for source 1"
+
+
+def _make_minimal_pipeline(
+    on_video_frame, exec_session_id: Optional[str] = None
+) -> InferencePipeline:
+    from unittest.mock import MagicMock
+
+    return InferencePipeline(
+        on_video_frame=on_video_frame,
+        video_sources=[],
+        predictions_queue=Queue(maxsize=8),
+        watchdog=MagicMock(),
+        status_update_handlers=[],
+        exec_session_id=exec_session_id,
+    )
+
+
+def test_inference_pipeline_instances_get_distinct_stream_session_ids() -> None:
+    pipeline_1 = _make_minimal_pipeline(on_video_frame=lambda frames: [])
+    pipeline_2 = _make_minimal_pipeline(on_video_frame=lambda frames: [])
+
+    assert pipeline_1._stream_session_id
+    assert pipeline_2._stream_session_id
+    assert pipeline_1._stream_session_id != pipeline_2._stream_session_id
+
+
+def test_inference_pipeline_factory_uses_supplied_exec_session_id(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "inference.core.interfaces.stream.inference_pipeline.prepare_video_sources",
+        lambda **kwargs: [],
+    )
+
+    pipeline = InferencePipeline.init_with_custom_logic(
+        video_reference="rtsp://camera-7",
+        on_video_frame=lambda frames: [],
+        exec_session_id="camera-7",
+    )
+
+    assert pipeline._stream_session_id == "camera-7"
+
+
+def test_inference_pipeline_empty_exec_session_id_mints_fallback() -> None:
+    pipeline_1 = _make_minimal_pipeline(
+        on_video_frame=lambda frames: [], exec_session_id=""
+    )
+    pipeline_2 = _make_minimal_pipeline(
+        on_video_frame=lambda frames: [], exec_session_id=""
+    )
+
+    assert pipeline_1._stream_session_id
+    assert pipeline_2._stream_session_id
+    assert pipeline_1._stream_session_id != pipeline_2._stream_session_id
+
+
+@pytest.mark.parametrize(
+    "factory_name",
+    ["init", "init_with_yolo_world", "init_with_workflow", "init_with_custom_logic"],
+)
+def test_inference_pipeline_factories_expose_optional_exec_session_id(
+    factory_name: str,
+) -> None:
+    parameter = signature(getattr(InferencePipeline, factory_name)).parameters[
+        "exec_session_id"
+    ]
+
+    assert parameter.default is None
+
+
+@pytest.mark.parametrize("disable_sinks", [False, True])
+def test_init_with_workflow_injects_sink_execution_policy(
+    disable_sinks: bool,
+    monkeypatch,
+) -> None:
+    from inference.core.workflows.execution_engine.core import ExecutionEngine
+
+    execution_engine = MagicMock()
+    execution_engine_init = MagicMock(return_value=execution_engine)
+    pipeline = MagicMock()
+    monkeypatch.setattr(ExecutionEngine, "init", execution_engine_init)
+    monkeypatch.setattr(
+        InferencePipeline,
+        "init_with_custom_logic",
+        MagicMock(return_value=pipeline),
+    )
+
+    result = InferencePipeline.init_with_workflow(
+        video_reference="video.mp4",
+        workflow_specification={"version": "1.0"},
+        model_manager=MagicMock(),
+        disable_sinks=disable_sinks,
+    )
+
+    assert result is pipeline
+    assert (
+        execution_engine_init.call_args.kwargs["init_parameters"][
+            "workflows_core.disable_sinks"
+        ]
+        is disable_sinks
+    )
+
+
+def test_init_with_workflow_gives_execution_engine_a_separate_thread_pool(
+    monkeypatch,
+) -> None:
+    # A shared pool lets slow fire-and-forget sink tasks starve step execution,
+    # so the Execution Engine must get its own executor.
+    from inference.core.workflows.execution_engine.core import ExecutionEngine
+
+    execution_engine = MagicMock()
+    execution_engine_init = MagicMock(return_value=execution_engine)
+    pipeline = MagicMock()
+    monkeypatch.setattr(ExecutionEngine, "init", execution_engine_init)
+    monkeypatch.setattr(
+        InferencePipeline,
+        "init_with_custom_logic",
+        MagicMock(return_value=pipeline),
+    )
+
+    result = InferencePipeline.init_with_workflow(
+        video_reference="video.mp4",
+        workflow_specification={"version": "1.0"},
+        model_manager=MagicMock(),
+        workflows_thread_pool_workers=3,
+        execution_engine_thread_pool_workers=5,
+    )
+
+    assert result is pipeline
+    blocks_executor = execution_engine_init.call_args.kwargs["init_parameters"][
+        "workflows_core.thread_pool_executor"
+    ]
+    execution_engine_executor = execution_engine_init.call_args.kwargs["executor"]
+    assert execution_engine_executor is not blocks_executor
+    assert blocks_executor._max_workers == 3
+    assert execution_engine_executor._max_workers == 5
+
+
+def test_execute_inference_tags_thread_with_pipeline_stream_session_id() -> None:
+    from threading import Thread
+    from unittest.mock import MagicMock
+
+    from inference.usage_tracking.stream_session import stream_session_id
+
+    ids_seen_by_inference: dict = {}
+
+    def make_on_video_frame(name):
+        def on_video_frame(video_frames):
+            ids_seen_by_inference[name] = stream_session_id.get()
+            return []
+
+        return on_video_frame
+
+    pipeline_1 = _make_minimal_pipeline(make_on_video_frame("pipeline_1"))
+    pipeline_2 = _make_minimal_pipeline(make_on_video_frame("pipeline_2"))
+    for pipeline in (pipeline_1, pipeline_2):
+        fake_frame = MagicMock()
+        pipeline._generate_frames = lambda frame=fake_frame: iter([[frame]])
+
+    threads = [
+        Thread(target=pipeline_1._execute_inference),
+        Thread(target=pipeline_2._execute_inference),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert ids_seen_by_inference["pipeline_1"] == pipeline_1._stream_session_id
+    assert ids_seen_by_inference["pipeline_2"] == pipeline_2._stream_session_id
+    assert stream_session_id.get() is None
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_completion_statistics_wait_for_prediction_futures(monkeypatch, failed) -> None:
+    monkeypatch.setenv("RFDETR_PIPELINE_DEPTH", "2")
+    resolving = Event()
+
+    class PendingPrediction(Future):
+        def result(self, timeout=None):
+            resolving.set()
+            return super().result(timeout=2)
+
+    pending = PendingPrediction()
+    sources = [VideoSourceStub(1, False, source_id=i) for i in range(2)]
+    frames = [source.read_frame() for source in sources]
+    watchdog = BasePipelineWatchDog()
+    watchdog.register_video_sources(sources)
+    queue = Queue()
+    errors = []
+    pipeline = InferencePipeline(
+        on_video_frame=lambda frames: [],
+        video_sources=sources,
+        predictions_queue=queue,
+        watchdog=watchdog,
+        status_update_handlers=[],
+    )
+    # The existing ready callback measures submission; completion must stay zero.
+    pipeline._queue_inference_result([{"output": pending}, {}], frames)
+    queue.put(None)
+
+    def dispatch():
+        try:
+            pipeline._dispatch_inference_results()
+        except Exception as error:
+            errors.append(error)
+
+    thread = Thread(target=dispatch)
+    thread.start()
+    try:
+        assert resolving.wait(timeout=2)
+        before = watchdog.get_report().completion_statistics
+        assert [s.completed_frames for s in before.sources] == [0, 0]
+        assert all(s.last_completed_at_monotonic is None for s in before.sources)
+        if failed:
+            pending.set_exception(ValueError("prediction failed"))
+        else:
+            pending.set_result("prediction")
+    finally:
+        if not pending.done():
+            pending.set_result(None)
+        thread.join(timeout=3)
+    assert not thread.is_alive()
+    after = watchdog.get_report().completion_statistics
+    assert [s.completed_frames for s in after.sources] == ([0, 0] if failed else [1, 1])
+    assert bool(errors) == failed
+    assert [s.completed_frames for s in before.sources] == [0, 0]
+    if not failed:
+        assert all(s.last_frame_id == 1 for s in after.sources)
+        assert all(
+            before.sampled_at_monotonic
+            <= s.last_completed_at_monotonic
+            <= after.sampled_at_monotonic
+            for s in after.sources
+        )
+
+
+def test_dispatch_preserves_legacy_duck_typed_watchdog(monkeypatch) -> None:
+    monkeypatch.setenv("RFDETR_PIPELINE_DEPTH", "1")
+    queue = Queue()
+    queue.put(([{}], []))
+    queue.put(None)
+    pipeline = InferencePipeline(
+        on_video_frame=lambda frames: [],
+        video_sources=[],
+        predictions_queue=queue,
+        watchdog=_PredictionReadyWatchdog(),
+        status_update_handlers=[],
+    )
+    pipeline._dispatch_inference_results()
+    assert queue.unfinished_tasks == 0
+
+
+def test_completion_counts_null_predictions_before_sink_failure(monkeypatch) -> None:
+    monkeypatch.setenv("RFDETR_PIPELINE_DEPTH", "1")
+    sources = [VideoSourceStub(1, False, source_id=i) for i in range(2)]
+    watchdog = BasePipelineWatchDog()
+    watchdog.register_video_sources(sources)
+    queue = Queue()
+    queue.put(([None], [sources[0].read_frame()]))
+    queue.put(None)
+    observed = []
+
+    def failing_sink(predictions, frames):
+        observed.append(
+            [
+                s.completed_frames
+                for s in watchdog.get_report().completion_statistics.sources
+            ]
+        )
+        assert predictions == [None, None]
+        assert frames[0].source_id == 0
+        assert frames[1] is None
+        raise RuntimeError("sink unavailable")
+
+    pipeline = InferencePipeline(
+        on_video_frame=lambda frames: [],
+        video_sources=sources,
+        predictions_queue=queue,
+        watchdog=watchdog,
+        status_update_handlers=[],
+        on_prediction=failing_sink,
+    )
+    pipeline._dispatch_inference_results()
+    assert observed == [[1, 0]]
+    assert queue.unfinished_tasks == 0
+
+
+class _EmptyVideoFileProducer(VideoFrameProducer):
+    """A video file without frames: its capture worker ends right away."""
+
+    def __init__(self) -> None:
+        self._opened = True
+
+    def grab(self) -> bool:
+        return False
+
+    def retrieve(self) -> Tuple[bool, Any]:
+        return False, None
+
+    def release(self) -> None:
+        self._opened = False
+
+    def isOpened(self) -> bool:
+        return self._opened
+
+    def discover_source_properties(self) -> SourceProperties:
+        return SourceProperties(
+            width=128, height=128, total_frames=0, is_file=True, fps=25
+        )
+
+
+def _video_source(
+    source_id: int,
+    terminated_sources: List[int],
+    startup_entered: Optional[Event] = None,
+    startup_gate: Optional[Event] = None,
+) -> VideoSource:
+    """Real `VideoSource` whose startup, if gated, blocks until `startup_gate`.
+
+    The producer factory runs inside `VideoSource.start()`, under the real
+    state lock, so a gated source holds that lock until the gate opens. Once
+    started, the source waits for its capture worker to end, so it is never
+    INITIALISING when terminated. Terminations are recorded by source id.
+    """
+
+    def open_video() -> VideoFrameProducer:
+        if startup_gate is not None:
+            startup_entered.set()
+            startup_gate.wait()
+        return _EmptyVideoFileProducer()
+
+    def record_termination(status_update: StatusUpdate) -> None:
+        if status_update.payload.get("new_state") is StreamState.TERMINATING:
+            terminated_sources.append(status_update.payload["source_id"])
+
+    video_source = VideoSource.init(
+        video_reference=open_video,
+        status_update_handlers=[record_termination],
+        source_id=source_id,
+    )
+    start = video_source.start
+
+    def start_until_capture_ended() -> None:
+        start()
+        capture_worker = video_source._stream_consumption_thread
+        capture_worker.join(timeout=10)
+        assert not capture_worker.is_alive(), "Capture worker did not stop"
+
+    video_source.start = start_until_capture_ended
+    return video_source
+
+
+def _pipeline_on(video_sources: List[VideoSource]) -> InferencePipeline:
+    return InferencePipeline(
+        on_video_frame=lambda frames: [None] * len(frames),
+        video_sources=video_sources,
+        predictions_queue=Queue(maxsize=8),
+        watchdog=MagicMock(),
+        status_update_handlers=[],
+    )
+
+
+def _terminator(pipeline: InferencePipeline, terminating: Event) -> Thread:
+    def terminate() -> None:
+        terminating.set()
+        pipeline.terminate()
+
+    return Thread(target=terminate, daemon=True)
+
+
+def _stop_leftover_threads(pipeline: InferencePipeline, terminator: Thread) -> None:
+    # Bounded cleanup after a failed assertion, so no worker outlives the test.
+    pipeline._stop = True
+    workers = [
+        terminator,
+        pipeline._inference_thread,
+        pipeline._dispatching_thread,
+    ] + [
+        video_source._stream_consumption_thread
+        for video_source in pipeline._video_sources
+    ]
+    for worker in workers:
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=10)
+
+
+def _join_pipeline(pipeline: InferencePipeline) -> None:
+    joiner = Thread(target=pipeline.join, daemon=True)
+    joiner.start()
+    joiner.join(timeout=10)
+    assert not joiner.is_alive(), "Pipeline workers did not stop"
+
+
+def test_terminate_waits_for_source_holding_its_startup_lock() -> None:
+    # given
+    startup_entered, startup_gate = Event(), Event()
+    terminated_sources = []
+    video_source = _video_source(
+        source_id=0,
+        terminated_sources=terminated_sources,
+        startup_entered=startup_entered,
+        startup_gate=startup_gate,
+    )
+    pipeline = _pipeline_on(video_sources=[video_source])
+    terminating = Event()
+    terminator = _terminator(pipeline=pipeline, terminating=terminating)
+
+    try:
+        pipeline.start(use_main_thread=False)
+        assert startup_entered.wait(timeout=10), "Source startup never began"
+        assert video_source._state_change_lock.locked()
+
+        # when
+        terminator.start()
+        assert terminating.wait(timeout=10), "terminate() was never called"
+        terminator.join(timeout=0.5)
+
+        # then
+        assert terminator.is_alive(), "terminate() returned during startup"
+        assert terminated_sources == []
+
+        startup_gate.set()
+        terminator.join(timeout=10)
+        assert not terminator.is_alive(), "terminate() did not complete"
+        assert terminated_sources == [0]
+        assert video_source.describe_source().state is StreamState.ENDED
+        _join_pipeline(pipeline=pipeline)
+    finally:
+        startup_gate.set()
+        _stop_leftover_threads(pipeline=pipeline, terminator=terminator)
+
+
+def test_terminate_waits_for_whole_startup_before_stopping_any_source() -> None:
+    # given
+    startup_entered, startup_gate = Event(), Event()
+    terminated_sources = []
+    started_source = _video_source(source_id=0, terminated_sources=terminated_sources)
+    gated_source = _video_source(
+        source_id=1,
+        terminated_sources=terminated_sources,
+        startup_entered=startup_entered,
+        startup_gate=startup_gate,
+    )
+    pipeline = _pipeline_on(video_sources=[started_source, gated_source])
+    terminating = Event()
+    terminator = _terminator(pipeline=pipeline, terminating=terminating)
+
+    try:
+        pipeline.start(use_main_thread=False)
+        assert startup_entered.wait(timeout=10), "Second source never began"
+        assert started_source.describe_source().state is StreamState.ENDED
+
+        # when
+        terminator.start()
+        assert terminating.wait(timeout=10), "terminate() was never called"
+        terminator.join(timeout=0.5)
+
+        # then - the already-started source is not stopped while the next one starts
+        assert terminator.is_alive(), "terminate() returned during startup"
+        assert terminated_sources == []
+
+        startup_gate.set()
+        terminator.join(timeout=10)
+        assert not terminator.is_alive(), "terminate() did not complete"
+        assert terminated_sources == [0, 1]
+        _join_pipeline(pipeline=pipeline)
+    finally:
+        startup_gate.set()
+        _stop_leftover_threads(pipeline=pipeline, terminator=terminator)
